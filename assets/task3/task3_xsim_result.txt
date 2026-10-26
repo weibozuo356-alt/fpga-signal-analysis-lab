@@ -1,0 +1,22 @@
+
+****** xsim v2019.1 (64-bit)
+  **** SW Build 2552052 on Fri May 24 14:49:42 MDT 2019
+  **** IP Build 2548770 on Fri May 24 18:01:18 MDT 2019
+    ** Copyright 1986-2019 Xilinx, Inc. All Rights Reserved.
+
+source xsim.dir/tb_task3_sim/xsim_script.tcl
+# xsim {tb_task3_sim} -autoloadwcfg -runall
+Vivado Simulator 2019.1
+Time resolution is 1 ps
+run -all
+PASS: below low threshold produces no pulse
+PASS: first high-threshold crossing produces one pulse
+PASS: remaining above high threshold does not retrigger
+PASS: falling below low threshold rearms detector
+PASS: two-second gate result = 50000
+PASS: binary 50000 converts to BCD 00050000 = 327680
+Task 3 Testbench complete: PASS=6, FAIL=0
+TASK 3 RESULT: PASS
+$finish called at time : 1306 ns : File "C:/Users/86152/AppData/Local/Temp/fpga_task3_xsim_dc17b5a5487843e693edca3354022eaf/tb_task3_frequency_measurement.v" Line 152
+exit
+INFO: [Common 17-206] Exiting xsim at Mon Oct 26 11:16:27 2026...
