@@ -11,7 +11,9 @@ module id_display #(
     output wire        dac_clk,
     output wire [13:0] dac_data,
 
-    // External 10-bit ADC interface
+    // 任务三：外接10位ADC接口
+    // ad_in是ADC对模拟电压量化后直接输出的0～1023数字码；
+    // clk_ad为50 MHz采样时钟，adc_clamp固定为0以关闭钳位。
     input  wire [9:0]  ad_in,
     output wire        clk_ad,
     output wire        adc_clamp,
@@ -40,24 +42,23 @@ module id_display #(
 
 
     // ============================================================
-    // ADC control
-    //
-    // A low level disables the ADC clamp function.
+    // 任务三：ADC钳位控制，低电平表示关闭钳位功能。
     // ============================================================
     assign adc_clamp = 1'b0;
 
 
     // ============================================================
-    // Forwarded 50 MHz ADC sampling clock
+    // 任务三：用ODDR向外部ADC转发50 MHz采样时钟。
+    // 采样周期为20 ns；这是ADC采样间隔，不是被测正弦波周期。
     // ============================================================
     ODDR #(
         .DDR_CLK_EDGE ("SAME_EDGE"),
         .INIT         (1'b0),
         .SRTYPE       ("SYNC")
     ) u_adc_clk_oddr (
-        .Q  (clk_ad),
-        .C  (clk_50m),
-        .CE (clk_10m_locked),
+        .Q  (clk_ad),          // 输出到外部ADC的采样时钟
+        .C  (clk_50m),         // 内部50 MHz时钟
+        .CE (clk_10m_locked),  // 时钟稳定后才允许输出
         .D1 (1'b1),
         .D2 (1'b0),
         .R  (1'b0),
@@ -184,71 +185,73 @@ module id_display #(
 
 
     // ============================================================
-    // Capture the external 10-bit ADC output
+    // 在50 MHz上升沿锁存外部ADC的10位结果。
+    // 例如adc_sample=650表示ADC当前量化码为650，并非FPGA计算出650。
     // ============================================================
-    reg [9:0] adc_sample = 10'd0;
+    reg [9:0] adc_sample = 10'd0; // 当前ADC样本，范围0～1023
 
     always @(posedge clk_50m) begin
         if (!clk_10m_locked) begin
             adc_sample <= 10'd0;
         end else begin
-            adc_sample <= ad_in;
+            adc_sample <= ad_in; // 每20 ns采入一个新码
         end
     end
 
 
     // ============================================================
-    // Automatic ADC calibration and frequency measurement
+    // 任务三核心：ADC自动校准与频率测量
     //
-    // After power-up or a frequency-selection change:
-    //
-    // 1. Wait 1 ms for the analog signal to settle.
-    // 2. Record ADC minimum and maximum for 10 ms.
-    // 3. Calculate midpoint and hysteresis thresholds.
-    // 4. Generate one rising pulse per waveform period.
-    // 5. Count waveform periods for 2 seconds.
+    // 上电或切换频率后依次执行：
+    // 1. 等待1 ms，使DDS、DAC及模拟回环的新波形稳定；
+    // 2. 在10 ms内记录ADC最小值和最大值；
+    // 3. 计算中点M、范围R以及高低迟滞门限；
+    // 4. 每个正弦周期只产生一次有效上升穿越脉冲；
+    // 5. 在2 s内累计穿越次数N，N/2即为频率Hz。
     // ============================================================
 
-    // 50 MHz * 1 ms = 50,000
+    // 50 MHz × 1 ms = 50 000个时钟。
     localparam integer ADC_SETTLE_CYCLES = 50_000;
 
-    // 50 MHz * 10 ms = 500,000
+    // 50 MHz × 10 ms = 500 000个采样点。
     localparam integer ADC_CALIBRATION_CYCLES = 500_000;
 
-    // 50 MHz * 2 s = 100,000,000
+    // 50 MHz × 2 s = 100 000 000个时钟。
     localparam integer FREQUENCY_GATE_CYCLES = 100_000_000;
 
 
-    // Synchronize the switches into the 50 MHz ADC domain.
-    reg [2:0] freq_sel_50m_meta = 3'b000;
-    reg [2:0] freq_sel_50m_sync = 3'b000;
-    reg [2:0] freq_sel_50m_last = 3'b000;
+    // 把异步频率选择开关同步到50 MHz域，并用last检测切换事件。
+    reg [2:0] freq_sel_50m_meta = 3'b000; // 第一级同步寄存器
+    reg [2:0] freq_sel_50m_sync = 3'b000; // 第二级同步稳定值
+    reg [2:0] freq_sel_50m_last = 3'b000; // 上一次已处理的选择码
 
 
-    // Calibration registers.
-    reg [15:0] adc_settle_count      = 16'd0;
-    reg [18:0] adc_calibration_count = 19'd0;
+    // 自动校准计数器与幅度统计寄存器。
+    reg [15:0] adc_settle_count      = 16'd0; // 1 ms稳定等待计数
+    reg [18:0] adc_calibration_count = 19'd0; // 10 ms校准窗口计数
 
-    reg [9:0] adc_minimum  = 10'd1023;
-    reg [9:0] adc_maximum  = 10'd0;
-    reg [9:0] adc_midpoint = 10'd512;
+    reg [9:0] adc_minimum  = 10'd1023; // 校准期间的最小ADC码
+    reg [9:0] adc_maximum  = 10'd0;    // 校准期间的最大ADC码
+    reg [9:0] adc_midpoint = 10'd512;  // M=(max+min)/2
 
+    // 未校准时先以512为中心设置±4个码，校准完成后自动覆盖。
     reg [9:0] adc_threshold_low  = 10'd508;
     reg [9:0] adc_threshold_high = 10'd516;
 
-    reg calibration_done = 1'b0;
+    reg calibration_done = 1'b0; // 为1表示信号有效且门限已经计算完成
 
 
-    // Crossing detector and frequency counter.
-    reg        adc_signal_high      = 1'b0;
-    reg        adc_rising_pulse     = 1'b0;
-    reg [26:0] frequency_gate_count = 27'd0;
-    reg [31:0] waveform_cycle_count = 32'd0;
-    reg [31:0] measured_frequency   = 32'd0;
-    reg        measurement_update_toggle = 1'b0;
+    // 迟滞穿越检测器与两秒门计数器。
+    reg        adc_signal_high      = 1'b0; // 1表示已经越过高门限
+    reg        adc_rising_pulse     = 1'b0; // 一次有效穿越产生一个20 ns脉冲
+    reg [26:0] frequency_gate_count = 27'd0; // 两秒门时间计数
+    reg [31:0] waveform_cycle_count = 32'd0; // 门内有效穿越次数
+    reg [31:0] measured_frequency   = 32'd0; // 测频结果，单位Hz
+    reg        measurement_update_toggle = 1'b0; // 新结果完成时翻转通知显示域
 
 
-    // Include the current sample in the minimum/maximum result.
+    // 把当前样本也纳入min/max候选值，避免校准最后一拍因非阻塞赋值
+    // 仍读取旧寄存器而漏掉最后一个采样点。
     wire [9:0] adc_minimum_next =
         (adc_sample < adc_minimum)
         ? adc_sample
@@ -259,9 +262,11 @@ module id_display #(
         ? adc_sample
         : adc_maximum;
 
+    // R=max-min，表示观测到的峰峰值，单位为ADC码。
     wire [9:0] adc_range_next =
         adc_maximum_next - adc_minimum_next;
 
+    // 两个10位数相加可能需要11位，随后右移一位得到中点M。
     wire [10:0] adc_sum_next =
         {1'b0, adc_minimum_next} +
         {1'b0, adc_maximum_next};
@@ -270,29 +275,31 @@ module id_display #(
         adc_sum_next[10:1];
 
 
-    // Hysteresis is one eighth of the measured signal range.
+    // 迟滞半宽H取R/8；右移3位就是除以8。
     wire [9:0] adc_hysteresis_raw =
         adc_range_next >> 3;
 
+    // H至少为4个ADC码，因此高低门限最小间隔为8个码。
     wire [9:0] adc_hysteresis_next =
         (adc_hysteresis_raw < 10'd4)
         ? 10'd4
         : adc_hysteresis_raw;
 
 
-    // One rising crossing per analog waveform period.
+    // 校准完成、当前处于低状态且样本达到高门限时，产生一次上升穿越。
+    // 之后必须先回落到低门限才会重新触发，因此每周期只计一次。
     wire adc_rising_crossing_now =
-        calibration_done &&
-        !adc_signal_high &&
-        (adc_sample >= adc_threshold_high);
+        calibration_done &&                    // 门限已经有效
+        !adc_signal_high &&                    // 检测器仍处于低状态
+        (adc_sample >= adc_threshold_high);    // 当前样本达到高门限
 
 
     always @(posedge clk_50m) begin
-        // Synchronize the asynchronous switches.
+        // 两级同步异步拨码开关。
         freq_sel_50m_meta <= freq_sel;
         freq_sel_50m_sync <= freq_sel_50m_meta;
 
-        // This debug pulse normally remains low.
+        // 默认清零；检测到穿越时才在本周期重新置1，形成20 ns单周期脉冲。
         adc_rising_pulse <= 1'b0;
 
         if (!clk_10m_locked) begin
@@ -318,7 +325,7 @@ module id_display #(
 
         end else if (freq_sel_50m_sync !=
                      freq_sel_50m_last) begin
-            // Restart calibration after changing frequency.
+            // 频率开关变化后，旧波形的门限和计数不再适用，重新校准。
             freq_sel_50m_last <= freq_sel_50m_sync;
 
             adc_settle_count      <= 16'd0;
@@ -334,14 +341,13 @@ module id_display #(
             waveform_cycle_count <= 32'd0;
             measured_frequency   <= 32'd0;
 
-            // Tell the display domain to show zero while the
-            // newly selected frequency is being measured.
+            // 清零测量值并翻转通知，使显示域在新结果完成前先显示0。
             measurement_update_toggle <=
                 ~measurement_update_toggle;
 
         end else if (adc_settle_count <
                      ADC_SETTLE_CYCLES - 1) begin
-            // Wait 1 ms for the new analog waveform to settle.
+            // 阶段1：等待1 ms，让新模拟波形稳定。
             adc_settle_count <=
                 adc_settle_count + 16'd1;
 
@@ -356,7 +362,7 @@ module id_display #(
             waveform_cycle_count <= 32'd0;
 
         end else if (!calibration_done) begin
-            // Record minimum and maximum for 10 ms.
+            // 阶段2：连续10 ms统计ADC最小值和最大值。
             adc_minimum <= adc_minimum_next;
             adc_maximum <= adc_maximum_next;
 
@@ -365,10 +371,11 @@ module id_display #(
 
                 adc_calibration_count <= 19'd0;
 
-                // Reject a missing or extremely small signal.
+                // R至少为32个ADC码才认为存在可用信号；否则重新校准。
                 if (adc_range_next >= 10'd32) begin
                     adc_midpoint <= adc_midpoint_next;
 
+                    // low=M-H，high=M+H，其中H=max(R/8,4)。
                     adc_threshold_low <=
                         adc_midpoint_next -
                         adc_hysteresis_next;
@@ -377,13 +384,13 @@ module id_display #(
                         adc_midpoint_next +
                         adc_hysteresis_next;
 
-                    calibration_done <= 1'b1;
+                    calibration_done <= 1'b1; // 下一周期进入正式测频
                     adc_signal_high  <= 1'b0;
 
                     frequency_gate_count <= 27'd0;
                     waveform_cycle_count <= 32'd0;
                 end else begin
-                    // No useful signal: repeat calibration.
+                    // 信号缺失或幅度过小：清空极值并重复校准。
                     adc_minimum <= 10'd1023;
                     adc_maximum <= 10'd0;
 
@@ -396,24 +403,24 @@ module id_display #(
             end
 
         end else begin
-            // Schmitt-trigger-style rising crossing detector.
+            // 阶段3：类似施密特触发器的迟滞上升穿越检测。
             if (adc_rising_crossing_now) begin
-                adc_signal_high  <= 1'b1;
-                adc_rising_pulse <= 1'b1;
+                adc_signal_high  <= 1'b1; // 锁定高状态，防止高门限附近重复触发
+                adc_rising_pulse <= 1'b1; // 输出一个50 MHz周期的事件脉冲
             end else if (adc_signal_high &&
                          (adc_sample <=
                           adc_threshold_low)) begin
-                adc_signal_high <= 1'b0;
+                adc_signal_high <= 1'b0; // 回到低门限后重新武装
             end
 
-            // Two-second measurement gate.
+            // 阶段4：在2 s固定门时间内直接统计上升穿越次数。
             if (frequency_gate_count ==
                 FREQUENCY_GATE_CYCLES - 1) begin
 
                 frequency_gate_count <= 27'd0;
 
-                // Count the final-cycle crossing, add one for
-                // rounding, and divide the two-second count by 2.
+                // 把门结束当前拍的穿越直接加入，固定加1用于除以2前四舍五入，
+                // 右移一位等价于除以2，最终结果单位为Hz。
                 measured_frequency <=
                     (waveform_cycle_count +
                      (adc_rising_crossing_now
@@ -421,7 +428,7 @@ module id_display #(
                       : 32'd0) +
                      32'd1) >> 1;
 
-                // Toggle once for every new completed result.
+                // 每个完整结果翻转一次，供100 MHz显示域可靠检测更新事件。
                 measurement_update_toggle <=
                     ~measurement_update_toggle;
 
@@ -432,6 +439,7 @@ module id_display #(
                     frequency_gate_count + 27'd1;
 
                 if (adc_rising_crossing_now) begin
+                    // 每个正弦周期只应在这里累加一次。
                     waveform_cycle_count <=
                         waveform_cycle_count + 32'd1;
                 end
@@ -441,13 +449,13 @@ module id_display #(
 
 
     // ============================================================
-    // ILA debug probes
+    // 任务三 ILA 调试探针
     //
-    // PROBE0: 10 bits - raw ADC sample
-    // PROBE1: 10 bits - calculated ADC midpoint
-    // PROBE2:  1 bit  - one-cycle rising pulse
-    // PROBE3: 32 bits - measured frequency in Hz
-    // PROBE4:  1 bit  - calibration complete
+    // PROBE0：10 位原始 ADC 采样码，可设为 Analog 观察数字采样波形；
+    // PROBE1：10 位自动计算得到的 ADC 波形中点；
+    // PROBE2：1 位、仅持续一个 clk_adc 周期的上升穿越脉冲；
+    // PROBE3：32 位测频结果，单位为 Hz；
+    // PROBE4：1 位校准完成标志。
     // ============================================================
     ila_adc u_ila_adc (
         .clk    (clk_50m),
@@ -460,49 +468,45 @@ module id_display #(
 
 
     // ============================================================
-    // Transfer the measured frequency into the 100 MHz display
-    // domain.
+    // 把 50 MHz 测频时钟域中的测量结果传递到 100 MHz 显示时钟域。
     //
-    // measured_frequency remains unchanged between measurements.
-    // The update toggle tells this domain when a complete new value
-    // is available, so the eight display digits all use one result.
+    // 任务三结果从50 MHz测频域跨到100 MHz显示域。
+    // measured_frequency在两次测量之间保持不变；update toggle每得到一个
+    // 完整结果翻转一次，显示域检测翻转后才装载数据，避免八位数字不一致。
     // ============================================================
     reg        display_mode_meta = 1'b0;
     reg        display_mode_sync = 1'b0;
 
-    reg [31:0] measured_frequency_meta = 32'd0;
-    reg [31:0] measured_frequency_sync = 32'd0;
+    reg [31:0] measured_frequency_meta = 32'd0; // 频率数据跨域第一级寄存
+    reg [31:0] measured_frequency_sync = 32'd0; // 显示域使用的稳定频率值
 
-    reg measurement_update_meta = 1'b0;
-    reg measurement_update_sync = 1'b0;
-    reg measurement_update_last = 1'b0;
+    reg measurement_update_meta = 1'b0; // 翻转通知第一级同步
+    reg measurement_update_sync = 1'b0; // 翻转通知第二级同步
+    reg measurement_update_last = 1'b0; // 上一拍同步值，用于检测变化
 
 
     // ============================================================
-    // Binary-to-BCD conversion
-    //
-    // A double-dabble conversion takes 32 clk_in cycles.  At
-    // 100 MHz this is only 320 ns, whereas measurements update once
-    // every two seconds.
-    //
-    // display_bcd[31:28] is the leftmost decimal digit.
-    // display_bcd[3:0]   is the rightmost decimal digit.
+    // 任务三显示：32位二进制频率转八位BCD。
+    // bcd_shift左32位为8个BCD四位组，右32位为待转换二进制数。
+    // 每轮先给所有≥5的BCD组分别加3，再整体左移1位；重复32轮。
+    // 100 MHz下总耗时320 ns，远小于2 s测量更新周期。
     // ============================================================
-    reg [63:0] bcd_shift     = 64'd0;
-    reg [5:0]  bcd_iteration = 6'd0;
-    reg        bcd_busy      = 1'b0;
-    reg [31:0] display_bcd   = 32'd0;
+    reg [63:0] bcd_shift     = 64'd0; // 左侧BCD工作区，右侧二进制输入
+    reg [5:0]  bcd_iteration = 6'd0;  // 0～31，共32轮
+    reg        bcd_busy      = 1'b0;  // 转换进行标志
+    reg [31:0] display_bcd   = 32'd0; // 八个可直接显示的BCD数字
 
     reg [63:0] bcd_adjusted;
     integer bcd_digit_index;
 
     always @(*) begin
-        bcd_adjusted = bcd_shift;
+        bcd_adjusted = bcd_shift; // 默认保持原值
 
         for (bcd_digit_index = 0;
              bcd_digit_index < 8;
              bcd_digit_index = bcd_digit_index + 1) begin
 
+            // 每一个4位BCD组单独判断，满足≥5时只给该组加3。
             if (bcd_shift[
                     32 + bcd_digit_index * 4 +: 4
                 ] >= 4'd5) begin
@@ -517,19 +521,20 @@ module id_display #(
     end
 
     wire [63:0] bcd_shift_next;
+    // 整体左移时，二进制最高位逐步进入BCD工作区，最右端补0。
     assign bcd_shift_next = bcd_adjusted << 1;
 
 
     always @(posedge clk_in) begin
-        // Synchronize the physical display-mode switch.
+        // 两级同步物理显示模式开关，降低异步输入的亚稳态传播风险。
         display_mode_meta <= display_mode;
         display_mode_sync <= display_mode_meta;
 
-        // Synchronize the stable frequency-result bus.
+        // 同步长期稳定的32位频率结果总线。
         measured_frequency_meta <= measured_frequency;
         measured_frequency_sync <= measured_frequency_meta;
 
-        // Synchronize and detect a new-result notification.
+        // 同步翻转通知，并通过sync与last不同检测一个新结果事件。
         measurement_update_meta <= measurement_update_toggle;
         measurement_update_sync <= measurement_update_meta;
         measurement_update_last <= measurement_update_sync;
@@ -537,6 +542,7 @@ module id_display #(
         if (measurement_update_sync !=
             measurement_update_last) begin
 
+            // 左侧BCD工作区清零，右侧装入新的二进制Hz值。
             bcd_shift <= {
                 32'd0,
                 measured_frequency_sync
@@ -546,9 +552,11 @@ module id_display #(
             bcd_busy      <= 1'b1;
 
         end else if (bcd_busy) begin
+            // 每个100 MHz时钟完成一轮“加3后左移”。
             bcd_shift <= bcd_shift_next;
 
             if (bcd_iteration == 6'd31) begin
+                // 保存next值以包含第32轮的最后一次移位结果。
                 display_bcd <= bcd_shift_next[63:32];
                 bcd_busy    <= 1'b0;
             end else begin
@@ -559,15 +567,17 @@ module id_display #(
 
 
     // ============================================================
-    // Seven-segment display scanning
+    // 八位数码管动态扫描
     //
-    // display_mode = 0: student ID 20051121
-    // display_mode = 1: measured frequency in Hz
+    // display_mode = 0：显示学号 20051121；
+    // display_mode = 1：显示任务三测得的频率，单位为 Hz。
     //
-    // Frequency values use all eight digits with leading zeros:
+    // 频率占用全部八位，不足的高位补 0：
     //       1 kHz -> 00001000
+    //      10 kHz -> 00010000
     //      50 kHz -> 00050000
     //       1 MHz -> 01000000
+    //     1.5 MHz -> 01500000
     //       2 MHz -> 02000000
     // ============================================================
     reg [31:0] scan_count = 32'd0;
@@ -586,10 +596,10 @@ module id_display #(
     end
 
 
-    // Select the digit for the current display position.
+    // 根据当前扫描位置选择要点亮的十进制数字。
     always @(*) begin
         if (!display_mode_sync) begin
-            // Student ID: 20051121
+            // 学号显示：20051121。
             case (scan_index)
                 3'd0: digit = 4'd2;
                 3'd1: digit = 4'd0;
@@ -602,7 +612,7 @@ module id_display #(
                 default: digit = 4'd0;
             endcase
         end else begin
-            // Measured frequency in Hz.
+            // 任务三频率显示：BCD 的每四位对应一位十进制数。
             case (scan_index)
                 3'd0: digit = display_bcd[31:28];
                 3'd1: digit = display_bcd[27:24];
@@ -618,7 +628,7 @@ module id_display #(
     end
 
 
-    // Active-high segments: {dp, g, f, e, d, c, b, a}
+    // 段选为高电平点亮，位序为 {dp, g, f, e, d, c, b, a}。
     always @(*) begin
         case (digit)
             4'd0: segment_code = 8'h3F;
@@ -643,7 +653,7 @@ module id_display #(
     end
 
 
-    // Blank the display briefly while switching digits.
+    // 切换位选时先短暂熄灭所有段，减轻相邻数码管之间的重影。
     always @(posedge clk_in) begin
         if (scan_count == 0) begin
             seg_cs_pin <= 8'h00;
