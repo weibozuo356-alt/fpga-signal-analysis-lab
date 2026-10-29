@@ -1,0 +1,18 @@
+ideal 50% square THD: 48.342585%
+H2..H49 square THD: 47.297133% (relative error 2.163%)
+ideal triangle THD: 12.115293%
+H2..H49 triangle THD: 12.114743% (relative error 0.005%)
+duty 20% square: ideal 113.373194%, H2..H49 112.090081% (relative error 1.132%)
+duty 30% square: ideal 76.376596%, H2..H49 75.369984% (relative error 1.318%)
+duty 40% square: ideal 55.622653%, H2..H49 54.619953% (relative error 1.803%)
+duty 50% square: ideal 48.342585%, H2..H49 47.297133% (relative error 2.163%)
+duty 60% square: ideal 55.622653%, H2..H49 54.619953% (relative error 1.803%)
+duty 70% square: ideal 76.376596%, H2..H49 75.369984% (relative error 1.318%)
+duty 80% square: ideal 113.373194%, H2..H49 112.090081% (relative error 1.132%)
+  10.0 kHz filtered square: 47.264524% (relative error 2.230%)
+  35.0 kHz filtered square: 46.915625% (relative error 2.952%)
+  36.0 kHz filtered square: 47.195566% (relative error 2.373%)
+  70.0 kHz filtered square: 46.926350% (relative error 2.930%)
+  71.0 kHz filtered square: 47.297133% (relative error 2.163%)
+ 100.0 kHz filtered square: 47.297133% (relative error 2.163%)
+PASS: automatic mode sums only H2..H49 harmonic bands

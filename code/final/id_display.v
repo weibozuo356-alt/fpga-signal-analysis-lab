@@ -332,6 +332,33 @@ module id_display #(
     reg        measurement_update_toggle = 1'b0; // 新结果完成时翻转，通知显示域
 
 
+    // ============================================================
+    // 任务五：外接10～100 kHz信号的自动采样率分档
+    //
+    // 50%占空比方波若要把理论THD截断误差控制在3%以内，
+    // 至少需要累计到第37次谐波。本设计累计到第49次谐波，
+    // 给平均抽取滤波器的幅频衰减和实际硬件误差留出余量。
+    //
+    // 为了让10～100 kHz范围内的基波和高次谐波都能被FFT分辨，
+    // 外接模式freq_sel=110按实测频率选择三档有效采样率：
+    //   profile=0：f<=35 kHz，10点平均后抽取，有效Fs=5 MSPS；
+    //   profile=1：35 kHz<f<=70 kHz，5点平均后抽取，有效Fs=10 MSPS；
+    //   profile=2：f>70 kHz，不抽取，有效Fs=50 MSPS。
+    // ============================================================
+    reg [1:0] thd_auto_rate_profile;
+
+    always @(*) begin
+        if (freq_sel_50m_sync != 3'b110)
+            thd_auto_rate_profile = 2'd0; // 固定档位不使用任务五分档
+        else if (measured_frequency > 32'd70000)
+            thd_auto_rate_profile = 2'd2; // 70～100 kHz：保留50 MSPS
+        else if (measured_frequency > 32'd35000)
+            thd_auto_rate_profile = 2'd1; // 35～70 kHz：有效10 MSPS
+        else
+            thd_auto_rate_profile = 2'd0; // 10～35 kHz：有效5 MSPS
+    end
+
+
     // 组合逻辑先把“当前adc_sample”也纳入min/max候选结果。
     // 这样在校准窗口最后一个时钟沿，计算门限时不会因为非阻塞赋值
     // 仍在读取旧adc_minimum/adc_maximum而漏掉最后一个样本。
@@ -536,34 +563,32 @@ module id_display #(
     end
 
 // ============================================================
-// 4096-point FFT input and output
+// 任务四、任务五共用：4096点FFT输入与输出
 //
-// Input:
-//   real part      = signed ADC sample centered around zero
-//   imaginary part = 0
-//
-// This version first verifies the raw FFT data path.
-// A window function will be added after the FFT is verified.
+// FFT输入是复数：实部为去除直流中心后的有符号ADC样本，虚部固定为0。
+// 每帧共送入4096个样本；送入FFT前先进行平均抽取，再乘Hann窗，
+// 用于减小非相干采样时的频谱泄漏。FFT输出采用自然顺序0～4095。
 // ============================================================
 
 
 // ------------------------------------------------------------
-// Frequency-dependent boxcar averaging and decimation
+// 任务四、任务五共用：按频率进行滑动平均与抽取
 //
-// The ADC and FFT IP clocks both remain at 50 MHz.  Only the
-// AXI input sample-valid rate is reduced for the low-frequency
-// ranges.  This gives the 4096-point FFT enough frequency
-// resolution for all six DAC output frequencies.
+// ADC和FFT IP的工作时钟始终是50 MHz，只降低送入FFT的AXI有效样本速率。
+// 低频档先对若干ADC样本求和并近似取平均，再每组只输出一个样本，
+// 从而降低有效采样率、缩小FFT频点间隔，兼顾低频分辨率与高频带宽。
 //
-//   freq_sel  measurement mode       average length  effective Fs
-//     000        1 kHz           500           100 kHz
-//     001       10 kHz            50             1 MHz
-//     010       50 kHz            10             5 MHz
-//     011        1 MHz             1            50 MHz
-//     100      1.5 MHz             1            50 MHz
-//     101        2 MHz             1            50 MHz
-//     110     auto 10...100 kHz      10             5 MHz
-//     111     reserved/default      500           100 kHz
+//   freq_sel   测量档位             平均长度       有效采样率Fs
+//     000      固定1 kHz               500          100 kSPS
+//     001      固定10 kHz               50            1 MSPS
+//     010      固定50 kHz               10            5 MSPS
+//     011      固定1 MHz                 1           50 MSPS
+//     100      固定1.5 MHz               1           50 MSPS
+//     101      固定2 MHz                 1           50 MSPS
+//     110      外接10～35 kHz            10            5 MSPS
+//              外接35～70 kHz             5           10 MSPS
+//              外接70～100 kHz            1           50 MSPS
+//     111      保留/默认                 500          100 kSPS
 // ------------------------------------------------------------
 reg [9:0] decimation_factor;
 
@@ -575,13 +600,19 @@ always @(*) begin
         3'b011: decimation_factor = 10'd1;
         3'b100: decimation_factor = 10'd1;
         3'b101: decimation_factor = 10'd1;
-        3'b110: decimation_factor = 10'd10;
+        3'b110: begin
+            case (thd_auto_rate_profile)
+                2'd2: decimation_factor = 10'd1;
+                2'd1: decimation_factor = 10'd5;
+                default: decimation_factor = 10'd10;
+            endcase
+        end
         default: decimation_factor = 10'd500;
     endcase
 end
 
 
-// Eleven signed ADC bits summed 500 times require 21 bits.
+// 11位有符号ADC数据最多累加500次，因此累加器使用21位，防止求和溢出。
 reg signed [20:0] decimation_sum = 21'sd0;
 reg        [9:0]  decimation_count = 10'd0;
 
@@ -597,9 +628,9 @@ assign decimation_sum_next =
     decimation_sum + adc_centered_21;
 
 
-// Use shifts instead of hardware dividers.  The scale factor is
-// common to the fundamental and harmonics, so it cancels in the
-// final THD ratio.
+// 用算术右移近似完成除法，避免综合出通用除法器。
+// 同一个比例会同时作用于基波和各次谐波，计算THD功率比时会相互抵消，
+// 因此这里的近似缩放不会改变最终THD比例。
 reg signed [20:0] decimation_scaled;
 
 always @(*) begin
@@ -617,9 +648,16 @@ always @(*) begin
         3'b100: decimation_scaled = adc_centered_21;
         3'b101: decimation_scaled = adc_centered_21;
 
-        // Automatic 10...100 kHz measurement mode.
-        3'b110: decimation_scaled =
-            decimation_sum_next >>> 4;
+        // 任务五外接10～100 kHz自动测量：按profile选择抽取倍数。
+        3'b110: begin
+            case (thd_auto_rate_profile)
+                2'd2: decimation_scaled = adc_centered_21;
+                2'd1: decimation_scaled =
+                    decimation_sum_next >>> 3; // approximately /5
+                default: decimation_scaled =
+                    decimation_sum_next >>> 4; // approximately /10
+            endcase
+        end
 
         default: decimation_scaled =
             decimation_sum_next >>> 9;
@@ -633,13 +671,9 @@ assign decimated_adc_sample = decimation_scaled[15:0];
 
 
 // ------------------------------------------------------------
-// FFT reset
-//
-// Keep the FFT in reset until:
-// 1. The Clock Wizard is locked.
-// 2. ADC calibration has completed.
-//
-// ARESETn is active low.
+// FFT复位控制
+// Clock Wizard锁定且ADC完成幅度/中点校准之后才释放FFT复位，
+// 防止启动阶段的无效样本进入频谱。aresetn为低有效复位。
 // ------------------------------------------------------------
 reg [1:0] fft_reset_sync = 2'b00;
 
@@ -662,11 +696,8 @@ assign fft_aresetn =
 
 
 // ------------------------------------------------------------
-// FFT configuration channel
-//
-// s_axis_config_tdata[0]:
-//   1 = forward FFT
-//   0 = inverse FFT
+// FFT配置通道
+// s_axis_config_tdata[0]=1选择正向FFT；配置仅在复位释放后发送一次。
 // ------------------------------------------------------------
 wire [7:0] fft_config_data;
 
@@ -699,12 +730,9 @@ end
 
 
 // ------------------------------------------------------------
-// FFT input AXI-Stream channel
-//
-// The lower 16 bits contain the real part.
-// The upper 16 bits contain the imaginary part, which is zero.
-//
-// tlast is asserted with every 4096th input sample.
+// FFT输入AXI-Stream通道
+// 低16位装入有符号实部，高16位为固定0的虚部；
+// 每送入第4096个样本时拉高tlast，标记一帧输入结束。
 // ------------------------------------------------------------
 reg [31:0] fft_input_data  = 32'd0;
 reg        fft_input_valid = 1'b0;
@@ -716,14 +744,12 @@ reg [11:0] fft_input_index = 12'd0;
 
 
 // ------------------------------------------------------------
-// 4096-point Hann window
-//
-// hann_4096_q15.mem contains unsigned positive Q1.15
-// coefficients from 0 to 32767.  The current FFT input index is
-// also the address of the corresponding window coefficient.
-//
-// An asynchronous ROM read keeps the sample and coefficient
-// alignment simple.  Vivado implements this as distributed ROM.
+// 4096点Hann窗
+// hann_4096_q15.mem保存0～32767范围的Q1.15正系数，
+// 当前FFT输入序号同时作为窗系数ROM地址，使第n个样本乘第n个窗系数。
+// ROM采用异步读，便于样本与系数对齐；Vivado通常将其实现为分布式ROM。
+// 加窗可抑制频谱泄漏，但会使单一频率的能量分散到相邻若干频点，
+// 因而后面的基波和谐波均按“频带”而不是单个频点累计功率。
 // ------------------------------------------------------------
 (* rom_style = "distributed" *)
 reg [15:0] hann_rom [0:4095];
@@ -760,19 +786,17 @@ always @(posedge clk_50m) begin
         fft_input_index <= 12'd0;
 
     end else begin
-        // Remove tvalid after an accepted sample.  A new averaged
-        // sample below may set it again in the same clock cycle.
+        // FFT接收当前样本后默认撤销tvalid；若本拍又形成新的抽取样本，
+        // 下方逻辑会在同一时钟周期结束时重新置1。
         if (fft_input_valid && fft_input_ready) begin
             fft_input_valid <= 1'b0;
         end
 
-        // Do not overwrite a sample while the FFT is applying
-        // back-pressure.  Pipelined Streaming I/O normally keeps
-        // tready high, but this also makes the source AXI-safe.
+        // 当FFT拉低tready施加背压时，保持当前样本不变，避免覆盖尚未接收的数据；
+        // 这样即使通常tready持续为高，输入端也仍符合AXI-Stream握手规则。
         if (!fft_input_valid || fft_input_ready) begin
             if (decimation_factor == 10'd1) begin
-                // The three high-frequency ranges use every ADC
-                // sample, with no averaging or decimation.
+                // 高频固定档或任务五profile=2使用每个ADC样本，不平均也不抽取。
                 decimation_sum   <= 21'sd0;
                 decimation_count <= 10'd0;
 
@@ -794,8 +818,7 @@ always @(posedge clk_50m) begin
 
             end else if (decimation_count ==
                          decimation_factor - 10'd1) begin
-                // decimation_sum_next includes the current ADC
-                // sample, completing this averaging group.
+                // decimation_sum_next已经包含当前ADC样本，本拍正好结束这一组平均。
                 decimation_sum   <= 21'sd0;
                 decimation_count <= 10'd0;
 
@@ -816,7 +839,7 @@ always @(posedge clk_50m) begin
                 end
 
             end else begin
-                // Continue forming the current average.
+                // 当前平均组尚未收满样本，继续累加并等待。
                 decimation_sum <= decimation_sum_next;
                 decimation_count <=
                     decimation_count + 10'd1;
@@ -827,15 +850,9 @@ end
 
 
 // ------------------------------------------------------------
-// FFT output signals
-//
-// For the selected unscaled configuration, each component is
-// presented in a 32-bit AXI field.
-//
-// Lower 32 bits: real part
-// Upper 32 bits: imaginary part
-//
-// The low 12 bits of TUSER contain XK_INDEX = 0...4095.
+// FFT输出信号
+// 当前FFT采用不缩放配置，实部和虚部分别占32位：低32位为实部，
+// 高32位为虚部；TUSER低12位给出当前频点序号XK_INDEX=0～4095。
 // ------------------------------------------------------------
 wire [63:0] fft_output_data;
 wire [15:0] fft_output_user;
@@ -858,7 +875,7 @@ assign fft_output_index =
     fft_output_user[11:0];
 
 
-// FFT diagnostic event signals.
+// FFT诊断事件：用于汇总帧错误、通道停顿等异常状态。
 wire fft_event_frame_started;
 wire fft_event_tlast_unexpected;
 wire fft_event_tlast_missing;
@@ -868,7 +885,7 @@ wire fft_event_data_out_channel_halt;
 
 
 // ------------------------------------------------------------
-// FFT IP instance
+// 4096点FFT IP实例
 // ------------------------------------------------------------
 fft_thd u_fft_thd (
     .aclk                           (clk_50m),
@@ -911,14 +928,10 @@ fft_thd u_fft_thd (
 
 
 // ============================================================
-// FFT bin power
-//
-// P[k] = Re[k]^2 + Im[k]^2
-//
-// The FFT output components are signed.  Convert each component
-// to its unsigned absolute value before squaring it.  The power,
-// index, valid and last signals are registered together so that
-// they remain aligned by bin.
+// 任务四、任务五共用：计算每个FFT频点的功率
+// P[k]=Re[k]^2+Im[k]^2。
+// FFT实部和虚部都是有符号数，先取绝对值再平方；功率、频点序号、
+// valid和last同时寄存，保证后级看到的是同一个频点的一组对齐数据。
 // ============================================================
 wire [31:0] fft_real_abs;
 wire [31:0] fft_imag_abs;
@@ -968,27 +981,28 @@ end
 
 
 // ============================================================
-// Fundamental detection and harmonic power bands
+// 任务四、任务五：寻找基波并建立谐波功率带
+// Hann窗会把一个正弦分量的能量扩展到相邻频点，因此任务四固定档
+// 对每个分量累计“中心频点±2”共5个频点，而不是只取中心一点。
+// 只统计正频率半区；负频率镜像包含重复信息，THD比值中不必再次加入。
 //
-// A Hann-windowed sinusoid occupies several nearby FFT bins.
-// Therefore each component uses a five-bin band:
-// center - 2 through center + 2.
-//
-// Only the positive-frequency half is accumulated.  The mirrored
-// negative-frequency bins contain the same information and are not
-// needed in the THD ratio.
-//
-// Modes 000...101 retain the known fundamental bins used by task 4.
-// Mode 110 searches bins 6...84 for the strongest component.  At
-// the 5 MSPS effective sample rate this covers 10...100 kHz.  The
-// detected bin from one FFT frame is used during the next frame.
+// freq_sel=000～101属于任务四，基波频点由已知固定频率直接给出；
+// freq_sel=110属于任务五，在允许搜索范围内找到功率最大的频点作为基波。
+// 切换有效采样率期间放宽最低搜索频点，避免旧测频值暂时遮住新基波。
+// 当前FFT帧检测出的基波位置从下一帧开始用于功率累计。
 // ============================================================
 wire thd_auto_mode;
 assign thd_auto_mode =
-    (freq_sel_50m_sync == 3'b110);
+    (freq_sel_50m_sync == 3'b110); // 110表示任务五外接信号自动THD模式
 
 localparam [11:0] AUTO_SEARCH_MIN_BIN = 12'd6;
 localparam [11:0] AUTO_SEARCH_MAX_BIN = 12'd84;
+
+wire [11:0] auto_search_min_bin;
+assign auto_search_min_bin =
+    (thd_auto_rate_profile != 2'd0)
+    ? 12'd3
+    : AUTO_SEARCH_MIN_BIN;
 
 reg [63:0] auto_search_peak_power = 64'd0;
 reg [11:0] auto_search_peak_bin   = 12'd0;
@@ -997,7 +1011,7 @@ reg        detected_fundamental_valid = 1'b0;
 
 wire auto_search_in_range;
 assign auto_search_in_range =
-    (fft_power_index >= AUTO_SEARCH_MIN_BIN) &&
+    (fft_power_index >= auto_search_min_bin) &&
     (fft_power_index <= AUTO_SEARCH_MAX_BIN);
 
 always @(posedge clk_50m) begin
@@ -1036,8 +1050,7 @@ reg [11:0] thd_bin_5;
 
 always @(*) begin
     case (freq_sel_50m_sync)
-        // 1 kHz, 10 kHz and 50 kHz all become bin 40.96
-        // after their respective decimation factors.
+        // 任务四低频三档经过各自抽取后，基波都落在约40.96号频点附近。
         3'b000,
         3'b001,
         3'b010: begin
@@ -1048,7 +1061,7 @@ always @(*) begin
             thd_bin_5 = 12'd205;
         end
 
-        // 1 MHz at 50 MSPS.
+        // 任务四固定1 MHz档，有效采样率50 MSPS。
         3'b011: begin
             thd_bin_1 = 12'd82;
             thd_bin_2 = 12'd164;
@@ -1057,7 +1070,7 @@ always @(*) begin
             thd_bin_5 = 12'd410;
         end
 
-        // 1.5 MHz at 50 MSPS.
+        // 任务四固定1.5 MHz档，有效采样率50 MSPS。
         3'b100: begin
             thd_bin_1 = 12'd123;
             thd_bin_2 = 12'd246;
@@ -1066,7 +1079,7 @@ always @(*) begin
             thd_bin_5 = 12'd614;
         end
 
-        // 2 MHz at 50 MSPS.
+        // 任务四固定2 MHz档，有效采样率50 MSPS。
         3'b101: begin
             thd_bin_1 = 12'd164;
             thd_bin_2 = 12'd328;
@@ -1075,7 +1088,7 @@ always @(*) begin
             thd_bin_5 = 12'd819;
         end
 
-        // Task 5: unknown 10...100 kHz fundamental.
+        // 任务五：外接10～100 kHz未知信号，使用自动检测到的基波频点。
         3'b110: begin
             thd_bin_1 = detected_fundamental_bin;
             thd_bin_2 = detected_fundamental_bin << 1;
@@ -1110,9 +1123,9 @@ wire [11:0] thd_band_half_width;
 assign thd_frequency_bins_valid =
     !thd_auto_mode || detected_fundamental_valid;
 
-// Fixed task-4 bins need five FFT bins total.  In automatic mode,
-// multiplying a rounded fundamental bin by five can move the
-// predicted harmonic center by up to 2.5 bins, so use nine bins.
+// 任务四已知频点使用中心±2的5点频带。
+// 任务五的thd_bin_1仍用于累计基波；其高次谐波另由后面的Q12精确中心
+// 和±3点频带判断，不再用整数基波频点简单相乘，避免高次谐波中心漂移。
 assign thd_band_half_width =
     thd_auto_mode ? 12'd4 : 12'd2;
 
@@ -1148,6 +1161,150 @@ reg [63:0] thd_power_3_accumulator = 64'd0;
 reg [63:0] thd_power_4_accumulator = 64'd0;
 reg [63:0] thd_power_5_accumulator = 64'd0;
 
+// 任务五严格THD：只累计整数倍谐波H2～H49附近的窄频带。
+// 如果把基波之外的所有频点都放入分子，算出的会是THD+N（总谐波失真加噪声），
+// 小幅度输入时宽带噪声会被大量计入，从而出现三角波、方波THD严重偏大的问题。
+localparam integer AUTO_HIGHEST_HARMONIC = 49; // 最高累计到第49次谐波
+localparam [27:0] AUTO_HARMONIC_HALF_WIDTH_Q12 = 28'd12288; // 12288=3个FFT频点(Q12)
+
+// 把独立测频结果换算为带12位小数的FFT频点位置：
+//   bin_q12 = 频率 × 4096点 × 2^12 / 有效采样率。
+// 使用预先计算的Q20比例常数完成换算，避免在FPGA中综合通用除法器。
+reg [21:0] auto_bin_scale_q20;
+
+always @(*) begin
+    case (thd_auto_rate_profile)
+        // profile=2：有效采样率50 MSPS。
+        2'd2: auto_bin_scale_q20 = 22'd351844;
+
+        // profile=1：有效采样率10 MSPS。
+        2'd1: auto_bin_scale_q20 = 22'd1759219;
+
+        // profile=0：有效采样率5 MSPS。
+        default: auto_bin_scale_q20 = 22'd3518437;
+    endcase
+end
+
+wire [53:0] auto_frequency_bin_product;
+assign auto_frequency_bin_product =
+    measured_frequency * auto_bin_scale_q20;
+
+wire [27:0] auto_frequency_fundamental_bin_q12;
+assign auto_frequency_fundamental_bin_q12 =
+    (auto_frequency_bin_product + 54'd524288) >> 20;
+
+wire auto_measured_frequency_valid;
+assign auto_measured_frequency_valid =
+    (measured_frequency >= 32'd10000) &&
+    (measured_frequency <= 32'd100000);
+
+// 上电后第一次两秒测频门尚未完成时，临时使用FFT搜索出的整数基波频点。
+// 测频结果有效后改用带12位小数的精确频点，避免把整数频点乘到H49时
+// 累积很大的中心误差。
+wire [27:0] auto_detected_fundamental_bin_q12;
+assign auto_detected_fundamental_bin_q12 =
+    {4'd0, detected_fundamental_bin, 12'd0};
+
+wire [27:0] auto_fundamental_bin_q12_next;
+assign auto_fundamental_bin_q12_next =
+    auto_measured_frequency_valid
+    ? auto_frequency_fundamental_bin_q12
+    : auto_detected_fundamental_bin_q12;
+
+// 频率到频点的乘法结果先寄存，再送入各谐波比较器。
+// measured_frequency每两秒才更新一次，多一级寄存不会影响可见刷新速度，
+// 却能切断长组合路径，帮助50 MHz时序收敛。
+reg [27:0] auto_fundamental_bin_q12 = 28'd0;
+
+always @(posedge clk_50m) begin
+    if (!fft_aresetn)
+        auto_fundamental_bin_q12 <= 28'd0;
+    else
+        auto_fundamental_bin_q12 <=
+            auto_fundamental_bin_q12_next;
+end
+
+wire [27:0] fft_power_index_q12;
+assign fft_power_index_q12 =
+    {4'd0, fft_power_index, 12'd0};
+
+wire [11:0] thd_auto_max_bin;
+assign thd_auto_max_bin =
+    (thd_auto_rate_profile == 2'd2)
+    ? 12'd410
+    : 12'd2048;
+
+wire [AUTO_HIGHEST_HARMONIC:2] thd_auto_harmonic_hits;
+genvar auto_harmonic_number;
+
+generate
+    for (auto_harmonic_number = 2;
+         auto_harmonic_number <= AUTO_HIGHEST_HARMONIC;
+         auto_harmonic_number = auto_harmonic_number + 1) begin
+        wire [27:0] harmonic_center_q12;
+
+        assign harmonic_center_q12 =
+            auto_fundamental_bin_q12 * auto_harmonic_number;
+
+        assign thd_auto_harmonic_hits[auto_harmonic_number] =
+            thd_auto_mode &&
+            detected_fundamental_valid &&
+            (auto_fundamental_bin_q12 != 28'd0) &&
+            (fft_power_index <= thd_auto_max_bin) &&
+            (fft_power_index_q12 +
+             AUTO_HARMONIC_HALF_WIDTH_Q12 >=
+             harmonic_center_q12) &&
+            (fft_power_index_q12 <=
+             harmonic_center_q12 +
+             AUTO_HARMONIC_HALF_WIDTH_Q12);
+    end
+endgenerate
+
+wire thd_auto_harmonic_bin;
+assign thd_auto_harmonic_bin = |thd_auto_harmonic_hits; // 命中H2～H49任一窄带即计入谐波
+
+reg [63:0] thd_auto_harmonic_accumulator = 64'd0; // 任务五H2～H49总谐波功率
+
+// 将“当前频点属于哪个频带”的判断结果与该频点功率一起打一拍。
+// 否则H2～H49的并行比较和归约或门会直接串在64位累加器之前，
+// 组合路径过长，目标Artix-7器件难以满足50 MHz时序。
+reg        thd_power_valid_pipeline = 1'b0;
+reg        thd_power_last_pipeline  = 1'b0;
+reg [11:0] thd_power_index_pipeline = 12'd0;
+reg [63:0] thd_bin_power_pipeline   = 64'd0;
+reg        thd_in_band_1_pipeline   = 1'b0;
+reg        thd_in_band_2_pipeline   = 1'b0;
+reg        thd_in_band_3_pipeline   = 1'b0;
+reg        thd_in_band_4_pipeline   = 1'b0;
+reg        thd_in_band_5_pipeline   = 1'b0;
+reg        thd_auto_harmonic_pipeline = 1'b0;
+
+always @(posedge clk_50m) begin
+    if (!fft_aresetn) begin
+        thd_power_valid_pipeline <= 1'b0;
+        thd_power_last_pipeline  <= 1'b0;
+        thd_power_index_pipeline <= 12'd0;
+        thd_bin_power_pipeline   <= 64'd0;
+        thd_in_band_1_pipeline   <= 1'b0;
+        thd_in_band_2_pipeline   <= 1'b0;
+        thd_in_band_3_pipeline   <= 1'b0;
+        thd_in_band_4_pipeline   <= 1'b0;
+        thd_in_band_5_pipeline   <= 1'b0;
+        thd_auto_harmonic_pipeline <= 1'b0;
+    end else begin
+        thd_power_valid_pipeline <= fft_power_valid;
+        thd_power_last_pipeline  <= fft_power_last;
+        thd_power_index_pipeline <= fft_power_index;
+        thd_bin_power_pipeline   <= fft_bin_power;
+        thd_in_band_1_pipeline   <= thd_in_band_1;
+        thd_in_band_2_pipeline   <= thd_in_band_2;
+        thd_in_band_3_pipeline   <= thd_in_band_3;
+        thd_in_band_4_pipeline   <= thd_in_band_4;
+        thd_in_band_5_pipeline   <= thd_in_band_5;
+        thd_auto_harmonic_pipeline <= thd_auto_harmonic_bin;
+    end
+end
+
 reg [63:0] thd_fundamental_power = 64'd0;
 reg [63:0] thd_harmonic_power    = 64'd0;
 reg        thd_power_ready       = 1'b0;
@@ -1159,6 +1316,7 @@ always @(posedge clk_50m) begin
         thd_power_3_accumulator <= 64'd0;
         thd_power_4_accumulator <= 64'd0;
         thd_power_5_accumulator <= 64'd0;
+        thd_auto_harmonic_accumulator <= 64'd0;
 
         thd_fundamental_power <= 64'd0;
         thd_harmonic_power    <= 64'd0;
@@ -1166,55 +1324,64 @@ always @(posedge clk_50m) begin
     end else begin
         thd_power_ready <= 1'b0;
 
-        if (fft_power_valid) begin
-            // Natural-order FFT output starts every frame at bin 0.
-            if (fft_power_index == 12'd0) begin
+        if (thd_power_valid_pipeline) begin
+            // FFT按自然顺序输出；看到bin 0表示新一帧开始，清零本帧累加器。
+            if (thd_power_index_pipeline == 12'd0) begin
                 thd_power_1_accumulator <= 64'd0;
                 thd_power_2_accumulator <= 64'd0;
                 thd_power_3_accumulator <= 64'd0;
                 thd_power_4_accumulator <= 64'd0;
                 thd_power_5_accumulator <= 64'd0;
+                thd_auto_harmonic_accumulator <= 64'd0;
             end else begin
-                if (thd_in_band_1) begin
+                if (thd_in_band_1_pipeline) begin
                     thd_power_1_accumulator <=
-                        thd_power_1_accumulator + fft_bin_power;
+                        thd_power_1_accumulator +
+                        thd_bin_power_pipeline;
                 end
 
-                if (thd_in_band_2) begin
+                if (thd_in_band_2_pipeline) begin
                     thd_power_2_accumulator <=
-                        thd_power_2_accumulator + fft_bin_power;
+                        thd_power_2_accumulator +
+                        thd_bin_power_pipeline;
                 end
 
-                if (thd_in_band_3) begin
+                if (thd_in_band_3_pipeline) begin
                     thd_power_3_accumulator <=
-                        thd_power_3_accumulator + fft_bin_power;
+                        thd_power_3_accumulator +
+                        thd_bin_power_pipeline;
                 end
 
-                if (thd_in_band_4) begin
+                if (thd_in_band_4_pipeline) begin
                     thd_power_4_accumulator <=
-                        thd_power_4_accumulator + fft_bin_power;
+                        thd_power_4_accumulator +
+                        thd_bin_power_pipeline;
                 end
 
-                if (thd_in_band_5) begin
+                if (thd_in_band_5_pipeline) begin
                     thd_power_5_accumulator <=
-                        thd_power_5_accumulator + fft_bin_power;
+                        thd_power_5_accumulator +
+                        thd_bin_power_pipeline;
+                end
+
+                if (thd_auto_harmonic_pipeline) begin
+                    thd_auto_harmonic_accumulator <=
+                        thd_auto_harmonic_accumulator +
+                        thd_bin_power_pipeline;
                 end
             end
 
-            // Bin 4095 is outside every band, so the required sums
-            // are already complete when TLAST arrives.
-            //
-            // The DAC sample rate is 10 MHz, so its first Nyquist
-            // band ends at 5 MHz.  Harmonics above that limit are
-            // mixed with DAC sampling images and clock feedthrough;
-            // do not count them as independent distortion tones.
-            if (fft_power_last &&
+            // bin 4095不属于任何目标频带，因此TLAST到来时本帧所需累加已经完成。
+            // 任务四DAC采样率为10 MHz，第一奈奎斯特区上限为5 MHz；
+            // 超过5 MHz的分量会与DAC采样镜像和时钟馈通混叠，
+            // 不应继续当作独立谐波加入任务四THD。
+            if (thd_power_last_pipeline &&
                 thd_frequency_bins_valid) begin
                 thd_fundamental_power <=
                     thd_power_1_accumulator;
 
                 case (freq_sel_50m_sync)
-                    // Up through the fifth harmonic is below 5 MHz.
+                    // 任务四1 kHz、10 kHz、50 kHz：H2～H5都低于5 MHz，全部计入。
                     3'b000,
                     3'b001,
                     3'b010: begin
@@ -1225,8 +1392,7 @@ always @(posedge clk_50m) begin
                             + thd_power_5_accumulator;
                     end
 
-                    // 1 MHz: use 2, 3 and 4 MHz.  The fifth
-                    // harmonic lies exactly on the DAC Nyquist edge.
+                    // 任务四1 MHz：计入H2、H3、H4；H5正好位于5 MHz边界，不计入。
                     3'b011: begin
                         thd_harmonic_power <=
                               thd_power_2_accumulator
@@ -1234,29 +1400,23 @@ always @(posedge clk_50m) begin
                             + thd_power_4_accumulator;
                     end
 
-                    // 1.5 MHz: use 3 and 4.5 MHz.
+                    // 任务四1.5 MHz：计入H2=3 MHz与H3=4.5 MHz。
                     3'b100: begin
                         thd_harmonic_power <=
                               thd_power_2_accumulator
                             + thd_power_3_accumulator;
                     end
 
-                    // 2 MHz: only the second harmonic at 4 MHz is
-                    // independently observable below 5 MHz.
+                    // 任务四2 MHz：5 MHz以下只有H2=4 MHz可独立观测。
                     3'b101: begin
                         thd_harmonic_power <=
                             thd_power_2_accumulator;
                     end
 
-                    // Task 5 auto mode: 100 kHz * 5 = 500 kHz,
-                    // safely below the 2.5 MHz Nyquist limit of
-                    // the 5 MSPS effective sample rate.
+                    // 任务五外接模式：严格THD只使用H2～H49整数次谐波窄带功率和。
                     3'b110: begin
                         thd_harmonic_power <=
-                              thd_power_2_accumulator
-                            + thd_power_3_accumulator
-                            + thd_power_4_accumulator
-                            + thd_power_5_accumulator;
+                            thd_auto_harmonic_accumulator; // 任务五严格THD分子
                     end
 
                     default: begin
@@ -1276,15 +1436,11 @@ end
 
 
 // ============================================================
-// Sequential fixed-point THD calculation
-//
-// ratio_q32 = (harmonic_power << 32) / fundamental_power
-// sqrt(ratio_q32) is the amplitude ratio in Q16 format.
-//
-// THD display units are 0.001 percent:
-//   thd_millipercent = sqrt(ratio) * 100000
-//
-// Example: 2196 means 2.196 percent.
+// 任务四、任务五共用：顺序定点THD计算
+// THD = sqrt(谐波总功率/基波功率)。先计算
+// ratio_q32=(harmonic_power<<32)/fundamental_power，得到Q32功率比，
+// 再开平方得到Q16幅度比。除法与开平方采用逐周期迭代，节省硬件资源。
+// thd_millipercent的单位为0.001%，例如2196表示2.196%。
 // ============================================================
 localparam [1:0] THD_IDLE = 2'd0;
 localparam [1:0] THD_DIV  = 2'd1;
@@ -1354,7 +1510,7 @@ wire [63:0] thd_millipercent_product;
 assign thd_millipercent_product =
     thd_sqrt_result_next * 64'd100000;
 
-reg [31:0] thd_millipercent = 32'd0;
+reg [31:0] thd_millipercent = 32'd0; // 单位0.001%，如48300表示48.300%
 reg        thd_result_valid = 1'b0;
 
 always @(posedge clk_50m) begin
@@ -1455,12 +1611,10 @@ end
 
 
 // ============================================================
-// Stable THD display value
-//
-// Raw FFT-based THD estimates vary slightly from frame to frame.
-// Average a power-of-two number of frames before updating the
-// seven-segment display.  The frame count is selected so that all
-// fixed and automatic ranges refresh in roughly 1.7 to 2.7 seconds.
+// 任务四、任务五共用：稳定数码管THD显示
+// 单帧FFT的THD会因噪声和非相干采样轻微波动，因此先对2的整数次幂帧数
+// 求平均，再更新数码管。各档平均帧数按有效采样率选择，使显示大约每
+// 1.7～2.7秒更新一次，既能稳定读数，也不会长时间没有响应。
 // ============================================================
 reg [14:0] thd_average_terminal_count;
 reg [3:0]  thd_average_shift;
@@ -1468,28 +1622,43 @@ reg [3:0]  thd_average_shift;
 always @(*) begin
     case (freq_sel_50m_sync)
         3'b000: begin
-            // 64 frames, approximately 2.621 s.
+            // 平均64帧，约2.621秒更新一次。
             thd_average_terminal_count = 15'd63;
             thd_average_shift = 4'd6;
         end
 
         3'b001: begin
-            // 512 frames, approximately 2.097 s.
+            // 平均512帧，约2.097秒更新一次。
             thd_average_terminal_count = 15'd511;
             thd_average_shift = 4'd9;
         end
 
-        3'b010,
-        3'b110: begin
-            // 2048 frames, approximately 1.678 s.
+        3'b010: begin
+            // 平均2048帧，约1.678秒更新一次。
             thd_average_terminal_count = 15'd2047;
             thd_average_shift = 4'd11;
+        end
+
+        3'b110: begin
+            if (thd_auto_rate_profile == 2'd2) begin
+                // 50 MSPS下平均32768帧，约2.684秒。
+                thd_average_terminal_count = 15'd32767;
+                thd_average_shift = 4'd15;
+            end else if (thd_auto_rate_profile == 2'd1) begin
+                // 10 MSPS下平均4096帧，约1.678秒。
+                thd_average_terminal_count = 15'd4095;
+                thd_average_shift = 4'd12;
+            end else begin
+                // 5 MSPS下平均2048帧，约1.678秒。
+                thd_average_terminal_count = 15'd2047;
+                thd_average_shift = 4'd11;
+            end
         end
 
         3'b011,
         3'b100,
         3'b101: begin
-            // 32768 frames, approximately 2.684 s.
+            // 平均32768帧，约2.684秒更新一次。
             thd_average_terminal_count = 15'd32767;
             thd_average_shift = 4'd15;
         end
@@ -1514,8 +1683,9 @@ assign thd_average_sum_next =
 assign thd_average_rounding =
     48'd1 << (thd_average_shift - 1'b1);
 
-reg [31:0] thd_display_millipercent = 32'd0;
+reg [31:0] thd_display_millipercent = 32'd0; // 多帧平均后的稳定显示值
 reg        thd_update_toggle = 1'b0;
+reg [1:0]  thd_auto_rate_profile_last = 2'd0;
 
 always @(posedge clk_50m) begin
     if (!fft_aresetn) begin
@@ -1523,20 +1693,31 @@ always @(posedge clk_50m) begin
         thd_average_count <= 15'd0;
         thd_display_millipercent <= 32'd0;
         thd_update_toggle <= 1'b0;
-    end else if (thd_result_valid) begin
-        if (thd_average_count ==
-            thd_average_terminal_count) begin
+        thd_auto_rate_profile_last <= 2'd0;
+    end else begin
+        thd_auto_rate_profile_last <= thd_auto_rate_profile;
 
-            thd_display_millipercent <=
-                (thd_average_sum_next + thd_average_rounding)
-                >> thd_average_shift;
-
+        // 任务五跨越35 kHz或70 kHz分档边界时清空平均器，
+        // 防止把不同有效采样率下的FFT结果混在同一次显示平均中。
+        if (thd_auto_rate_profile !=
+            thd_auto_rate_profile_last) begin
             thd_average_sum   <= 48'd0;
             thd_average_count <= 15'd0;
-            thd_update_toggle <= ~thd_update_toggle;
-        end else begin
-            thd_average_sum <= thd_average_sum_next;
-            thd_average_count <= thd_average_count + 15'd1;
+        end else if (thd_result_valid) begin
+            if (thd_average_count ==
+                thd_average_terminal_count) begin
+
+                thd_display_millipercent <=
+                    (thd_average_sum_next + thd_average_rounding)
+                    >> thd_average_shift;
+
+                thd_average_sum   <= 48'd0;
+                thd_average_count <= 15'd0;
+                thd_update_toggle <= ~thd_update_toggle;
+            end else begin
+                thd_average_sum <= thd_average_sum_next;
+                thd_average_count <= thd_average_count + 15'd1;
+            end
         end
     end
 end
@@ -1551,15 +1732,10 @@ assign fft_error_any =
      | fft_event_data_in_channel_halt
      | fft_event_data_out_channel_halt;
     // ============================================================
-    // ILA debug probes
-    //
-    // PROBE0: 11 bits - centered ADC sample
-    // PROBE1: 12 bits - active/detected fundamental bin
-    // PROBE2: 32 bits - THD in 0.001-percent units
-    // PROBE3: 32 bits - low half of fundamental band power
-    // PROBE4:  1 bit  - new THD result pulse
-    // PROBE5:  1 bit  - registered FFT frame last
-    // PROBE6:  1 bit  - FFT error summary
+    // 任务四、任务五ILA调试探针
+    // PROBE0：去直流后的11位ADC样本；PROBE1：当前/检测到的基波频点；
+    // PROBE2：原始THD，单位0.001%；PROBE3：基波功率低32位；
+    // PROBE4：新THD结果脉冲；PROBE5：FFT帧结束；PROBE6：FFT错误汇总。
     // ============================================================
     ila_adc u_ila_adc (
         .clk    (clk_50m),
@@ -1573,7 +1749,6 @@ assign fft_error_any =
     );
 
 
-    // ============================================================
     // 把显示模式开关以及任务三、四、五的测量结果同步到100 MHz显示时钟域。
     // 任务三的measured_frequency产生于50 MHz ADC域，不能直接作为显示控制事件；
     // 因此用frequency_display_value_meta/sync同步稳定的数据总线，

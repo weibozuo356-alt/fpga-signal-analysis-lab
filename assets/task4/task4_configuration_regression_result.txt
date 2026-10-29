@@ -1,0 +1,8 @@
+freq_sel=000: f=1000 Hz, decimation=500, Fs_eff=100000 Hz, exact bin=40.960, configured bin=41
+freq_sel=001: f=10000 Hz, decimation=50, Fs_eff=1000000 Hz, exact bin=40.960, configured bin=41
+freq_sel=010: f=50000 Hz, decimation=10, Fs_eff=5000000 Hz, exact bin=40.960, configured bin=41
+freq_sel=011: f=1000000 Hz, decimation=1, Fs_eff=50000000 Hz, exact bin=81.920, configured bin=82
+freq_sel=100: f=1500000 Hz, decimation=1, Fs_eff=50000000 Hz, exact bin=122.880, configured bin=123
+freq_sel=101: f=2000000 Hz, decimation=1, Fs_eff=50000000 Hz, exact bin=163.840, configured bin=164
+Hann coefficients: count=4096, min=0, max=32767, first=0, last=0
+PASS: fixed profiles, Hann table and task-4 band logic are present
