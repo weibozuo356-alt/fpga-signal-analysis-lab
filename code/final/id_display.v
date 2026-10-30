@@ -12,7 +12,8 @@ module id_display #(
     input  wire        clk_in,
     // 任务二频率选择开关，三位选择码按{SW2,SW1,SW0}读取：
     // 000→1 kHz，001→10 kHz，010→50 kHz，011→1 MHz，
-    // 100→1.5 MHz，101→2 MHz；110和111默认回到1 kHz。
+    // 100→1.5 MHz，101→2 MHz；110和111的DDS仍默认输出1 kHz。
+    // 当选择111且处于频率显示模式时，数码管改为显示DDS理论频率分辨率。
     input  wire [2:0]  freq_sel,
     // 显示模式选择：同步后的值为0时显示任务一ID 20051121；
     // 值为1时显示后续任务的频率或THD测量结果。
@@ -121,6 +122,11 @@ module id_display #(
     localparam [31:0] K_1P5MHZ = 32'd644245094; // 约产生1.5 MHz
     localparam [31:0] K_2MHZ   = 32'd858993459; // 约产生2 MHz
 
+    // 10 MHz / 2^32 = 0.002328306... Hz。
+    // 八位数码管最多显示七位小数，因此把Hz值放大10^7并四舍五入：
+    // 0.002328306... × 10^7 ≈ 23283，配合最左位小数点显示0.0023283。
+    localparam [31:0] DDS_RESOLUTION_DISPLAY_VALUE = 32'd23283;
+
 
     // 根据同步后的三位拨码选择码，返回对应的32位频率控制字。
     // function描述的是组合逻辑，不会单独形成时钟寄存器。
@@ -136,7 +142,8 @@ module id_display #(
                 3'b100: select_frequency_word = K_1P5MHZ; // SW2~SW0=100：1.5 MHz
                 3'b101: select_frequency_word = K_2MHZ;   // SW2~SW0=101：2 MHz
 
-                // 110和111没有分配新的任务二频点，统一输出默认1 kHz。
+                // 110和111没有分配新的DDS输出频点，仍输出默认1 kHz；
+                // 111的0.0023283 Hz只属于数码管信息显示，不改变DDS输出。
                 default: select_frequency_word = K_1KHZ;
             endcase
         end
@@ -1759,6 +1766,13 @@ assign fft_error_any =
     reg        display_mode_sync = 1'b0;
     reg        display_mode_last = 1'b0;
 
+    // 将三位频率选择开关单独同步到100 MHz显示域。
+    // freq_sel_display_last用于检测000～111之间的选择码变化，
+    // 保证拨到111或离开111时立即重新装载数码管显示数据。
+    reg [2:0] freq_sel_display_meta = 3'b000;
+    reg [2:0] freq_sel_display_sync = 3'b000;
+    reg [2:0] freq_sel_display_last = 3'b000;
+
     reg thd_display_select_meta = 1'b0;
     reg thd_display_select_sync = 1'b0;
     reg thd_display_select_last = 1'b0;
@@ -1776,6 +1790,24 @@ assign fft_error_any =
     reg thd_display_update_meta = 1'b0;
     reg thd_display_update_sync = 1'b0;
     reg thd_display_update_last = 1'b0;
+
+    // 只有在“测量显示、频率页面、freq_sel=111”三个条件同时满足时，
+    // 才显示任务二DDS理论频率分辨率；学号和THD页面均保持原行为。
+    wire dds_resolution_display_active;
+
+    assign dds_resolution_display_active =
+        display_mode_sync &&
+        !thd_display_select_sync &&
+        (freq_sel_display_sync == 3'b111);
+
+    // 频率页面送入Double Dabble的二进制数据源。
+    // 普通档位仍使用任务三实测频率；111使用放大10^7后的固定分辨率值。
+    wire [31:0] frequency_bcd_source;
+
+    assign frequency_bcd_source =
+        (freq_sel_display_sync == 3'b111)
+        ? DDS_RESOLUTION_DISPLAY_VALUE
+        : frequency_display_value_sync;
 
 
     // ============================================================
@@ -1825,6 +1857,10 @@ assign fft_error_any =
         display_mode_sync <= display_mode_meta;
         display_mode_last <= display_mode_sync;
 
+        freq_sel_display_meta <= freq_sel;
+        freq_sel_display_sync <= freq_sel_display_meta;
+        freq_sel_display_last <= freq_sel_display_sync;
+
         thd_display_select_meta <= thd_display_select;
         thd_display_select_sync <= thd_display_select_meta;
         thd_display_select_last <= thd_display_select_sync;
@@ -1856,13 +1892,15 @@ assign fft_error_any =
         // 任一显示选择开关改变时，立即按新模式重新装载当前数据并启动BCD转换。
         if ((display_mode_sync != display_mode_last) ||
             (thd_display_select_sync !=
-             thd_display_select_last)) begin
+             thd_display_select_last) ||
+            (freq_sel_display_sync !=
+             freq_sel_display_last)) begin
 
             bcd_shift <= {
                 32'd0, // 左32位BCD工作区先清零
                 thd_display_select_sync
                 ? thd_display_value_sync
-                : frequency_display_value_sync
+                : frequency_bcd_source
             };
 
             bcd_iteration <= 6'd0;
@@ -1876,7 +1914,7 @@ assign fft_error_any =
             // 任务三频率显示模式收到新结果：把二进制Hz值装入右32位。
             bcd_shift <= {
                 32'd0,
-                frequency_display_value_sync
+                frequency_bcd_source
             };
 
             bcd_iteration <= 6'd0;
@@ -1917,7 +1955,8 @@ assign fft_error_any =
     //     显示固定学生ID 20051121，这是任务一工作模式。
     //
     // 开关4 = 1、开关3 = 0：
-    //     显示任务三测得的频率，单位Hz；例如50000显示为00050000。
+    //     freq_sel=000～110时显示任务三测得的频率，单位Hz；
+    //     freq_sel=111时显示任务二DDS理论分辨率0.0023283 Hz。
     //
     // 开关4 = 1、开关3 = 1：
     //     显示后续任务测得的THD，并保留三位小数。
@@ -1930,6 +1969,17 @@ assign fft_error_any =
 
     // 当前扫描位置，三位宽度可自然循环表示0～7。
     reg [2:0]  scan_index = 3'd0;
+
+    // THD页面在第4位后显示小数点，形成xxx.xxxx形式；
+    // DDS分辨率页面在最左位后显示小数点，形成0.0023283 Hz。
+    wire measurement_decimal_point_active;
+
+    assign measurement_decimal_point_active =
+        (display_mode_sync &&
+         thd_display_select_sync &&
+         (scan_index == 3'd4)) ||
+        (dds_resolution_display_active &&
+         (scan_index == 3'd0));
 
     // 当前扫描位置准备显示的十进制数字0～9。
     reg [3:0] digit;
@@ -2032,9 +2082,7 @@ assign fft_error_any =
                 // 第0～3号位置使用第0组段数据线。
                 // 任务一中display_mode_sync=0，三目运算结果就是segment_code。
                 seg_data_0_pin <=
-                    (display_mode_sync &&
-                     thd_display_select_sync &&
-                     (scan_index == 3'd4))
+                    measurement_decimal_point_active
                     ? (segment_code | 8'h80)
                     : segment_code;
 
@@ -2044,9 +2092,7 @@ assign fft_error_any =
                 // 第4～7号位置使用第1组段数据线。
                 seg_data_0_pin <= 8'h00;
                 seg_data_1_pin <=
-                    (display_mode_sync &&
-                     thd_display_select_sync &&
-                     (scan_index == 3'd4))
+                    measurement_decimal_point_active
                     ? (segment_code | 8'h80)
                     : segment_code;
             end

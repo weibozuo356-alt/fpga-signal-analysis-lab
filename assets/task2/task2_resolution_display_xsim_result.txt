@@ -1,0 +1,10 @@
+PASS: freq_sel=111 BCD payload is 00023283
+PASS: resolution page is active only on frequency display
+PASS: resolution decimal point follows the leftmost zero
+PASS: physical segment-data output drives the decimal point
+PASS: THD decimal point remains at digit 4
+PASS: freq_sel=111 does not replace the THD page
+PASS: student-ID page still starts with digit 2
+PASS: student-ID page has no measurement decimal point
+Task 2 resolution-display test: PASS=8 FAIL=0
+TASK 2 RESOLUTION DISPLAY RESULT: PASS

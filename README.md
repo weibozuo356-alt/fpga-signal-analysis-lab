@@ -10,7 +10,7 @@
 - [任务一实验图片](assets/task1/)
 - [任务二：正弦信号产生——设计分析报告](reports/task2/任务二_正弦信号产生_设计分析报告.md)
 - [任务二：DDS、DAC与上板验证学习日志](notes/task2/任务二_正弦信号产生_学习日志.md)
-- [任务二专用Testbench](code/task2/tb_task2_dds.v)
+- [任务二专用Testbench（六频点与`111`分辨率显示）](code/task2/)
 - [任务二实验图片](assets/task2/)
 - [任务三：正弦信号频率测量——设计分析报告](reports/task3/任务三_正弦信号频率测量_设计分析报告.md)
 - [任务三：ADC测频与显示学习日志](notes/task3/任务三_正弦信号频率测量_学习日志.md)
