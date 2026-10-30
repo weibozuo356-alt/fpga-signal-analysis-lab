@@ -141,10 +141,12 @@ $$
 50%方波只含奇次谐波，理想THD为：
 
 $$
-THD_{square,50\%}
+\mathrm{THD}_{\mathrm{square},\,D=0.5}
 =\sqrt{\frac{1}{3^2}+\frac{1}{5^2}+\frac{1}{7^2}+\cdots}
-=48.342585\%
+=0.48342585
 $$
+
+上式为无量纲幅度比，换算成百分数后为48.342585%。
 
 累计到H49时得到47.297133%，相对截断误差为2.163%，满足小于3%的要求。三角波奇次谐波幅度按$1/n^2$下降，H49结果12.114743%，理想值12.115293%，相对误差约0.005%。
 
@@ -244,8 +246,10 @@ PASS: automatic mode sums only H2..H49 harmonic bands
 相对误差采用：
 
 $$
-\varepsilon=\frac{|THD_{meas}-THD_{theory}|}{THD_{theory}}\times100\%
+\varepsilon=\frac{|THD_{meas}-THD_{theory}|}{THD_{theory}}\times100
 $$
+
+式中计算结果的单位为百分数。
 
 最终验收时至少选择一个低频点、分档边界附近频点和高频点，且记录信号源实际幅度与终端条件。
 
